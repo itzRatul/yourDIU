@@ -28,6 +28,7 @@ from typing import Optional
 from app.services.ai.groq_service import chat_completion, chat_completion_stream, quick_classify, DIU_SYSTEM_PROMPT
 from app.services.search.search_router import web_search, format_search_results
 from app.services.rag.retriever import RAGRetriever
+from app.services.navigation.navigator import detect_navigation_intent, get_route_context, list_all_locations, is_navigation_query
 from app.core.supabase import supabase_admin
 
 logger = logging.getLogger("yourDIU.brain")
@@ -49,9 +50,16 @@ SEARCH_KEYWORDS = [
     "latest", "news", "today", "recent", "current", "2026", "admission",
     "notice", "circular", "result", "আজকের", "সর্বশেষ", "নতুন",
 ]
+NAVIGATION_LOCATION_LIST_KEYWORDS = [
+    "campus locations", "all locations", "campus map", "where can i go",
+    "list of places", "কোন কোন জায়গা", "campus e ki ki ache", "campus jagah",
+]
 
 def _detect_intent(query: str) -> str:
     q = query.lower()
+    # Navigation: check first (before other intents — "food court e jabo" has "food" which could confuse)
+    if is_navigation_query(q):
+        return "navigation"
     if any(k in q for k in ROUTINE_KEYWORDS):
         return "routine"
     if any(k in q for k in TEACHER_KEYWORDS):
@@ -140,6 +148,28 @@ def _build_teacher_context(query: str) -> str:
     return format_availability_for_ai(summary)
 
 
+def _build_navigation_context(query: str) -> str:
+    """Detect navigation intent, run Dijkstra, return route context for LLM."""
+    q = query.lower()
+
+    # User asking for list of locations
+    if any(k in q for k in NAVIGATION_LOCATION_LIST_KEYWORDS):
+        return list_all_locations()
+
+    pair = detect_navigation_intent(query)
+    if pair is None:
+        # Navigation keyword detected but couldn't extract two locations
+        return (
+            "CAMPUS NAVIGATION NOTE:\n"
+            "The user seems to want navigation help but I couldn't identify two campus locations.\n"
+            "Ask the user to specify their current location AND their destination from the list of campus places.\n"
+            f"{list_all_locations()}"
+        )
+
+    start, end = pair
+    return get_route_context(start, end)
+
+
 # ── Main brain entry point ───────────────────────────────────────────────────
 
 async def get_answer(
@@ -168,7 +198,10 @@ async def get_answer(
 
     # ── Build context based on intent ────────────────────────────────────────
 
-    if intent == "routine":
+    if intent == "navigation":
+        context_block = _build_navigation_context(query)
+
+    elif intent == "routine":
         context_block = _build_routine_context(query)
 
     elif intent == "teacher":
