@@ -7,8 +7,10 @@ Completely separate from the main DIU assistant chat.
 Design:
   - PDFs are TEMPORARY (7-day TTL) — for research, not archival
   - Raw PDF bytes are discarded after processing; only chunks + embeddings persist
-  - AI answers ONLY from the PDF content
-  - Web search requires explicit per-query user approval
+  - AI answers ONLY from the PDF content — no training data leakage
+  - Even if the AI "knows" the answer from training, it will NOT answer unless
+    that information is present in the uploaded PDF
+  - Web search is a SEPARATE explicit user action (allow_web_search=True)
   - Chat history is client-side (passed in request body, not stored server-side)
 
 Endpoints:
@@ -21,11 +23,15 @@ Endpoints:
   POST   /pdf-chat/sessions/{id}/chat/sync       — sync chat (for testing / mobile)
 
 SSE event types (chat endpoint):
-  {"type": "meta",             "mode": "pdf_rag|pdf_search", "session_id": "..."}
-  {"type": "chunk",            "content": "..."}
-  {"type": "needs_permission", "search_query": "...", "message": "..."}
+  {"type": "meta",  "mode": "pdf_rag|pdf_search|not_found", "session_id": "..."}
+  {"type": "chunk", "content": "..."}
   {"type": "done"}
-  {"type": "error",            "message": "..."}
+  {"type": "error", "message": "..."}
+
+mode values:
+  pdf_rag    — answered from PDF content
+  pdf_search — PDF + web search (user explicitly sent allow_web_search=true)
+  not_found  — answer not found in PDF (AI says so directly, no web search prompt)
 """
 
 import json
@@ -247,17 +253,17 @@ async def chat_with_pdf(
     """
     Stream AI responses grounded in the uploaded PDF.
 
+    The AI will ONLY answer from the uploaded PDF content.
+    If the answer is not in the PDF, it will say so directly — it will NOT
+    answer from general knowledge even if it "knows" the answer.
+
+    To also search the web, send allow_web_search=true (explicit user action).
+
     SSE event format:
-      data: {"type": "meta", "mode": "...", "session_id": "..."}
+      data: {"type": "meta",  "mode": "pdf_rag|pdf_search|not_found", "session_id": "..."}
       data: {"type": "chunk", "content": "..."}
-      data: {"type": "needs_permission", "search_query": "...", "message": "..."}
       data: {"type": "done"}
       data: {"type": "error", "message": "..."}
-
-    When type=needs_permission:
-      - The AI could not find the answer in the PDF
-      - Frontend should ask the user: "Search the web for this?"
-      - Re-send the same message with allow_web_search=true to get a web-augmented answer
     """
     session = _get_session_or_404(session_id, current_user.id)
     _assert_ready(session)
@@ -266,7 +272,7 @@ async def chat_with_pdf(
 
     async def event_stream():
         try:
-            gen, mode, search_query = await get_pdf_answer(
+            gen, mode = await get_pdf_answer(
                 session_id       = session_id,
                 query            = body.message,
                 history          = history,
@@ -274,20 +280,10 @@ async def chat_with_pdf(
                 stream           = True,
             )
 
-            # If no PDF match → send needs_permission event and stop
-            if mode == "needs_permission":
-                yield _sse({
-                    "type":         "needs_permission",
-                    "search_query": search_query,
-                    "message":      "I couldn't find this in the PDF. Would you like me to search the web?",
-                })
-                yield _sse({"type": "done"})
-                return
-
-            # Send meta first
+            # Send meta first (mode tells frontend if answer came from PDF, web, or not found)
             yield _sse({"type": "meta", "mode": mode, "session_id": session_id})
 
-            # Stream chunks
+            # Stream the answer (or the "not found" message)
             async for chunk_text in gen:
                 yield _sse({"type": "chunk", "content": chunk_text})
 
@@ -325,7 +321,7 @@ async def chat_with_pdf_sync(
 
     history = _history_to_dicts(body.history)
 
-    answer, mode, search_query = await get_pdf_answer(
+    answer, mode = await get_pdf_answer(
         session_id       = session_id,
         query            = body.message,
         history          = history,
@@ -333,16 +329,11 @@ async def chat_with_pdf_sync(
         stream           = False,
     )
 
-    response = {
+    return {
         "answer":     answer,
-        "mode":       mode,
+        "mode":       mode,        # "pdf_rag" | "pdf_search" | "not_found"
         "session_id": session_id,
     }
-    if mode == "needs_permission":
-        response["search_query"] = search_query
-        response["needs_permission"] = True
-
-    return response
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────

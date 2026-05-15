@@ -3,19 +3,18 @@ PDF Brain Service
 =================
 Orchestrates AI chat for a single PDF session.
 
-Design contract:
-  - AI answers ONLY from the provided PDF content (no hallucination from training data)
-  - If no relevant content found → return "needs_permission" signal
-  - Frontend shows "Search web for this?" dialog (per-query, not a global toggle)
-  - If user approves → same query re-sent with allow_web_search=True → web search injected
-
-Chat history is client-side only (passed in request body).
-No server-side history stored — consistent with temporary session design.
+Design contract (strict):
+  - AI answers ONLY from the provided PDF content
+  - Even if the AI "knows" the answer from training data, it must NOT answer
+    unless that information is explicitly present in the PDF text
+  - If no relevant content found in PDF → return "not_found" (not a web search prompt)
+  - Web search is a SEPARATE explicit user action only (allow_web_search=True)
+  - Chat history is client-side only (passed in request body, not stored server-side)
 
 Modes returned:
-  pdf_rag        — answered from PDF chunks
-  pdf_search     — PDF chunks + web search results combined
-  needs_permission — no PDF match found, asking user to allow web search
+  pdf_rag    — answered from PDF chunks
+  pdf_search — PDF chunks + web search (user explicitly requested)
+  not_found  — answer not in PDF (returned directly, no web search prompt)
 """
 
 import asyncio
@@ -31,34 +30,44 @@ logger = logging.getLogger("yourDIU.pdf_brain")
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
+# This prompt is the core anti-hallucination contract.
+# The wording is intentionally verbose and repetitive — LLMs respond better to
+# explicit, repeated constraints than a single short instruction.
 _PDF_ONLY_SYSTEM = """\
-You are a PDF Research Assistant. Answer questions STRICTLY from the provided PDF content.
+You are a PDF Research Assistant. Your ONLY knowledge source is the PDF content provided below.
 
-Rules — follow exactly:
-1. Use ONLY information from the PDF context below. Do NOT use general knowledge or training data.
-2. Cite page numbers where the answer comes from: write (Page 3) or (Pages 2–4) inline.
-3. If the information is NOT in the provided PDF context, respond with this exact sentence:
-   "I couldn't find this in the PDF."
-   Do NOT guess, infer, or make up anything.
-4. Quote short relevant excerpts from the PDF to support your answer when helpful.
-5. Answer in the same language the user writes in (Bangla or English).
-6. Be concise but complete.\
+CRITICAL RULES — you MUST follow these without exception:
+
+1. FORBIDDEN: Using ANY knowledge from your training data, even if you are 100% sure of the answer.
+   Example: If someone asks "What is the capital of Bangladesh?" and this is NOT in the PDF,
+   you MUST say "This information is not in the uploaded PDF." — even though you know the answer is Dhaka.
+
+2. REQUIRED: Answer ONLY using exact information found in the PDF context section below.
+   If the PDF contains it → answer with page reference: "According to the PDF (Page 3), ..."
+   If the PDF does NOT contain it → say exactly: "This information is not in the uploaded PDF."
+
+3. FORBIDDEN: Guessing, inferring, extrapolating, or combining PDF content with outside knowledge.
+
+4. REQUIRED: Cite the page number for every fact: write (Page 3) or (Pages 2–4) inline.
+
+5. REQUIRED: Answer in the same language the user writes in (Bangla or English).
+
+6. If you find partial information in the PDF, share what is there and state clearly what is missing.\
 """
 
 _PDF_WITH_WEB_SYSTEM = """\
-You are a PDF Research Assistant with web search access. Answer using BOTH the PDF content
-and the web search results provided below.
+You are a PDF Research Assistant. The user has explicitly requested both PDF content and web search results.
+Answer using the provided PDF content AND web search results below.
 
 Rules:
-1. Prioritize PDF content. Use web results to supplement details not in the PDF.
-2. Always cite sources inline: (PDF, Page 3) or (Web) for each fact.
+1. Prioritize PDF content over web results.
+2. Cite every fact: (PDF, Page 3) or (Web) inline.
 3. Answer in the same language the user writes in (Bangla or English).
-4. Be concise but complete.\
+4. Be accurate and concise.\
 """
 
-_NO_RESULT_MESSAGE = (
-    "I couldn't find this in the PDF. Would you like me to search the web for this?"
-)
+# Returned directly when PDF has no relevant content — no web search offer
+_NOT_FOUND_MESSAGE = "This information is not in the uploaded PDF."
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -73,11 +82,13 @@ async def get_pdf_answer(
     """
     Answer a query using the PDF session's chunks.
 
-    Returns (when stream=False): (answer: str, mode: str, search_query: str | None)
-    Returns (when stream=True):  (async_generator, mode, search_query | None)
+    allow_web_search=True means the user explicitly clicked "Search web" in the UI.
+    This is NOT triggered automatically — it is always an explicit user action.
 
-    search_query is set only when mode == "needs_permission" — it's the query
-    the frontend should surface to the user in the "Allow web search?" dialog.
+    Returns (stream=False): (answer: str, mode: str)
+    Returns (stream=True):  (async_generator, mode)
+
+    mode: "pdf_rag" | "pdf_search" | "not_found"
     """
     # Retrieve chunks (sync embedding + DB call → thread pool)
     chunks = await asyncio.to_thread(
@@ -85,32 +96,32 @@ async def get_pdf_answer(
     )
     found_in_pdf = has_good_context(chunks)
 
-    # ── Case 1: Nothing relevant in PDF ──────────────────────────────────────
+    # ── Case 1: No relevant content in PDF ───────────────────────────────────
     if not found_in_pdf:
         if not allow_web_search:
-            # Signal frontend to ask permission
+            # Just tell user it's not in the PDF — no automatic web search prompt
+            logger.info("PDF brain: no match in PDF (session=%s) — returning not_found", session_id)
             if stream:
-                async def _permission_stream():
-                    yield _NO_RESULT_MESSAGE
-                return _permission_stream(), "needs_permission", query
+                async def _not_found_stream():
+                    yield _NOT_FOUND_MESSAGE
+                return _not_found_stream(), "not_found"
             else:
-                return _NO_RESULT_MESSAGE, "needs_permission", query
+                return _NOT_FOUND_MESSAGE, "not_found"
 
-        # User approved web search
-        logger.info("PDF brain: no PDF match, searching web (session=%s)", session_id)
+        # User explicitly requested web search (and PDF had nothing)
+        logger.info("PDF brain: no PDF match, web search explicitly requested (session=%s)", session_id)
         web_results, provider = await web_search(query, max_results=5, prefer_diu=False)
         web_ctx = format_search_results(web_results, max_chars=3000)
-
-        system  = _PDF_WITH_WEB_SYSTEM + f"\n\n--- PDF Content ---\n(No relevant sections found)\n\n--- Web Results ---\n{web_ctx}"
+        system  = _PDF_WITH_WEB_SYSTEM + f"\n\n--- PDF Content ---\n(No relevant sections found in uploaded PDF)\n\n--- Web Results ---\n{web_ctx}"
         mode    = "pdf_search"
 
-    # ── Case 2: Found good PDF context ───────────────────────────────────────
+    # ── Case 2: Found relevant PDF context ───────────────────────────────────
     else:
         pdf_ctx = format_pdf_context(chunks)
         system  = _PDF_ONLY_SYSTEM + f"\n\n--- PDF Content ---\n{pdf_ctx}"
         mode    = "pdf_rag"
 
-        # If user already granted permission, optionally supplement with web
+        # If user also requested web search, supplement (but PDF content takes priority)
         if allow_web_search:
             web_results, _ = await web_search(query, max_results=3, prefer_diu=False)
             if web_results:
@@ -136,7 +147,7 @@ async def get_pdf_answer(
                 )
                 yield answer
 
-        return _stream_with_fallback(), mode, None
+        return _stream_with_fallback(), mode
 
     # ── Sync ──────────────────────────────────────────────────────────────────
     try:
@@ -148,7 +159,7 @@ async def get_pdf_answer(
             messages, system_prompt=system, max_tokens=1500
         )
 
-    return answer, mode, None
+    return answer, mode
 
 
 # ── Summary generator ─────────────────────────────────────────────────────────
@@ -156,9 +167,7 @@ async def get_pdf_answer(
 async def generate_pdf_summary(session_id: str) -> str:
     """
     Generate a structured summary of the entire PDF.
-
-    Fetches all chunks (ordered), builds a content block (capped at 14k chars
-    to stay within LLM context), then asks for a structured summary.
+    Fetches all chunks ordered by position, builds content block (capped at 14k chars).
     """
     from app.core.supabase import supabase_admin
 
@@ -174,7 +183,6 @@ async def generate_pdf_summary(session_id: str) -> str:
     if not chunks:
         raise RuntimeError("No content found for this PDF session.")
 
-    # Build representative content block
     parts: list[str] = []
     total = 0
     max_chars = 14_000
