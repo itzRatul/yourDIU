@@ -35,6 +35,10 @@ playwright>=1.44.0
 lxml>=5.2.0
 requests>=2.32.0
 
+# Routine PDF parsing
+pdfplumber>=0.11.0
+pillow>=10.0.0         # Gemini Vision fallback
+
 # Utilities
 rich>=13.7.0
 python-multipart>=0.0.9   # file uploads
