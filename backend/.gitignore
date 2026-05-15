@@ -1,0 +1,20 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.log
+
+# Scraped raw data (too large for git)
+../data/raw/
+
+# Local vector cache
+*.faiss
+*.pkl
+
+# IDE
+.vscode/
+.idea/
