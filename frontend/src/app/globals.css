@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-base:     #0F1117;
+  --bg-card:     #1A1D27;
+  --bg-hover:    #22263A;
+  --border:      #2A2E42;
+  --text:        #E2E8F0;
+  --text-dim:    #9CA3AF;
+  --green:       #00A86B;
+  --green-light: #00D68F;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text);
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar        { width: 6px; height: 6px; }
+::-webkit-scrollbar-track  { background: var(--bg-base); }
+::-webkit-scrollbar-thumb  { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3A3F57; }
+
+/* Markdown in chat bubbles */
+.prose-chat p              { margin: 0 0 0.5rem; }
+.prose-chat p:last-child   { margin-bottom: 0; }
+.prose-chat ul             { list-style: disc;    padding-left: 1.2rem; margin: 0.4rem 0; }
+.prose-chat ol             { list-style: decimal; padding-left: 1.2rem; margin: 0.4rem 0; }
+.prose-chat li             { margin: 0.15rem 0; }
+.prose-chat strong         { color: var(--green-light); }
+.prose-chat code           { background: #22263A; padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+.prose-chat pre            { background: #22263A; padding: 0.75rem; border-radius: 8px; overflow-x: auto; margin: 0.5rem 0; }
+.prose-chat pre code       { background: none; padding: 0; }
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  from { background-position: -400px 0; }
+  to   { background-position:  400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 6px;
+}
