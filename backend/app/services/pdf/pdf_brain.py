@@ -3,18 +3,19 @@ PDF Brain Service
 =================
 Orchestrates AI chat for a single PDF session.
 
-Design contract (strict):
+Design contract:
   - AI answers ONLY from the provided PDF content
-  - Even if the AI "knows" the answer from training data, it must NOT answer
-    unless that information is explicitly present in the PDF text
-  - If no relevant content found in PDF → return "not_found" (not a web search prompt)
-  - Web search is a SEPARATE explicit user action only (allow_web_search=True)
-  - Chat history is client-side only (passed in request body, not stored server-side)
+  - Even if AI "knows" the answer from training data, it must NOT use it —
+    it must answer only from what is written in the PDF
+  - If PDF says "Bangladesh capital = New York", AI answers "New York" (follows PDF)
+  - If content is NOT in PDF → tell user + ask permission to search web
+  - Web search only happens with explicit per-query user approval
+  - Chat history is client-side (passed in request body, not stored server-side)
 
 Modes returned:
-  pdf_rag    — answered from PDF chunks
-  pdf_search — PDF chunks + web search (user explicitly requested)
-  not_found  — answer not in PDF (returned directly, no web search prompt)
+  pdf_rag          — answered from PDF chunks
+  pdf_search       — PDF + web search (user explicitly approved)
+  needs_permission — content not in PDF; frontend shows "Search web?" dialog
 """
 
 import asyncio
@@ -30,44 +31,47 @@ logger = logging.getLogger("yourDIU.pdf_brain")
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
-# This prompt is the core anti-hallucination contract.
-# The wording is intentionally verbose and repetitive — LLMs respond better to
-# explicit, repeated constraints than a single short instruction.
+# Core anti-hallucination prompt.
+# Verbosely repeated constraints work better than single short instructions.
 _PDF_ONLY_SYSTEM = """\
 You are a PDF Research Assistant. Your ONLY knowledge source is the PDF content provided below.
 
-CRITICAL RULES — you MUST follow these without exception:
+CRITICAL RULES — follow without exception:
 
-1. FORBIDDEN: Using ANY knowledge from your training data, even if you are 100% sure of the answer.
-   Example: If someone asks "What is the capital of Bangladesh?" and this is NOT in the PDF,
-   you MUST say "This information is not in the uploaded PDF." — even though you know the answer is Dhaka.
+1. FORBIDDEN: Using ANY knowledge from your training data.
+   - Even if you know the answer from training, you must NOT use it.
+   - Example: If someone asks "What is the capital of Bangladesh?" and the PDF does NOT
+     mention it, you must say the PDF does not contain this information.
+   - Example: If the PDF says "Bangladesh capital = New York", you must answer "New York"
+     because that is what the PDF says — even if you know it is wrong.
 
-2. REQUIRED: Answer ONLY using exact information found in the PDF context section below.
-   If the PDF contains it → answer with page reference: "According to the PDF (Page 3), ..."
-   If the PDF does NOT contain it → say exactly: "This information is not in the uploaded PDF."
+2. REQUIRED: Answer ONLY using information explicitly written in the PDF context below.
+   - If the PDF contains it → answer with page reference: "According to the PDF (Page 3), ..."
+   - If the PDF does NOT contain it → say: "This topic is not covered in the uploaded PDF."
 
-3. FORBIDDEN: Guessing, inferring, extrapolating, or combining PDF content with outside knowledge.
+3. FORBIDDEN: Guessing, inferring from outside knowledge, or supplementing with training data.
 
-4. REQUIRED: Cite the page number for every fact: write (Page 3) or (Pages 2–4) inline.
+4. REQUIRED: Cite the page number for every fact you state: (Page 3) or (Pages 2–4).
 
-5. REQUIRED: Answer in the same language the user writes in (Bangla or English).
-
-6. If you find partial information in the PDF, share what is there and state clearly what is missing.\
+5. REQUIRED: Answer in the same language the user writes in (Bangla or English).\
 """
 
 _PDF_WITH_WEB_SYSTEM = """\
-You are a PDF Research Assistant. The user has explicitly requested both PDF content and web search results.
+You are a PDF Research Assistant. The user has approved a web search to supplement the PDF.
 Answer using the provided PDF content AND web search results below.
 
 Rules:
 1. Prioritize PDF content over web results.
-2. Cite every fact: (PDF, Page 3) or (Web) inline.
+2. Cite every fact inline: (PDF, Page 3) or (Web).
 3. Answer in the same language the user writes in (Bangla or English).
 4. Be accurate and concise.\
 """
 
-# Returned directly when PDF has no relevant content — no web search offer
-_NOT_FOUND_MESSAGE = "This information is not in the uploaded PDF."
+# Shown when no relevant content found in PDF
+_NEEDS_PERMISSION_MESSAGE = (
+    "This topic is not covered in the uploaded PDF. "
+    "Would you like me to search the web for this?"
+)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -82,38 +86,45 @@ async def get_pdf_answer(
     """
     Answer a query using the PDF session's chunks.
 
-    allow_web_search=True means the user explicitly clicked "Search web" in the UI.
-    This is NOT triggered automatically — it is always an explicit user action.
+    Flow:
+      1. Search PDF chunks (pgvector)
+      2. Found relevant content → answer strictly from PDF (no training data)
+      3. NOT found → return needs_permission (frontend asks user: "Search web?")
+      4. User approves → re-sent with allow_web_search=True → web search injected
 
-    Returns (stream=False): (answer: str, mode: str)
-    Returns (stream=True):  (async_generator, mode)
+    Returns (stream=False): (answer: str, mode: str, search_query: str | None)
+    Returns (stream=True):  (async_generator, mode, search_query | None)
 
-    mode: "pdf_rag" | "pdf_search" | "not_found"
+    search_query is set when mode == "needs_permission" (for frontend display).
     """
-    # Retrieve chunks (sync embedding + DB call → thread pool)
+    # Retrieve chunks (sync embedding + DB → thread pool)
     chunks = await asyncio.to_thread(
         retrieve_pdf_chunks, session_id, query, top_k=6, threshold=0.28
     )
     found_in_pdf = has_good_context(chunks)
 
-    # ── Case 1: No relevant content in PDF ───────────────────────────────────
+    # ── Case 1: Nothing relevant in PDF ──────────────────────────────────────
     if not found_in_pdf:
         if not allow_web_search:
-            # Just tell user it's not in the PDF — no automatic web search prompt
-            logger.info("PDF brain: no match in PDF (session=%s) — returning not_found", session_id)
+            # Ask user permission before doing any web search
+            logger.info("PDF brain: no match in PDF, asking permission (session=%s)", session_id)
             if stream:
-                async def _not_found_stream():
-                    yield _NOT_FOUND_MESSAGE
-                return _not_found_stream(), "not_found"
+                async def _permission_stream():
+                    yield _NEEDS_PERMISSION_MESSAGE
+                return _permission_stream(), "needs_permission", query
             else:
-                return _NOT_FOUND_MESSAGE, "not_found"
+                return _NEEDS_PERMISSION_MESSAGE, "needs_permission", query
 
-        # User explicitly requested web search (and PDF had nothing)
-        logger.info("PDF brain: no PDF match, web search explicitly requested (session=%s)", session_id)
+        # User approved web search and PDF had nothing — search only from web
+        logger.info("PDF brain: no PDF match, web search approved (session=%s)", session_id)
         web_results, provider = await web_search(query, max_results=5, prefer_diu=False)
         web_ctx = format_search_results(web_results, max_chars=3000)
-        system  = _PDF_WITH_WEB_SYSTEM + f"\n\n--- PDF Content ---\n(No relevant sections found in uploaded PDF)\n\n--- Web Results ---\n{web_ctx}"
-        mode    = "pdf_search"
+        system  = _PDF_WITH_WEB_SYSTEM + (
+            "\n\n--- PDF Content ---\n"
+            "(No relevant sections found in the uploaded PDF)\n\n"
+            f"--- Web Results ---\n{web_ctx}"
+        )
+        mode = "pdf_search"
 
     # ── Case 2: Found relevant PDF context ───────────────────────────────────
     else:
@@ -121,13 +132,16 @@ async def get_pdf_answer(
         system  = _PDF_ONLY_SYSTEM + f"\n\n--- PDF Content ---\n{pdf_ctx}"
         mode    = "pdf_rag"
 
-        # If user also requested web search, supplement (but PDF content takes priority)
+        # User also approved web search to supplement the PDF answer
         if allow_web_search:
             web_results, _ = await web_search(query, max_results=3, prefer_diu=False)
             if web_results:
                 web_ctx = format_search_results(web_results, max_chars=2000)
-                system  = _PDF_WITH_WEB_SYSTEM + f"\n\n--- PDF Content ---\n{pdf_ctx}\n\n--- Web Results ---\n{web_ctx}"
-                mode    = "pdf_search"
+                system  = _PDF_WITH_WEB_SYSTEM + (
+                    f"\n\n--- PDF Content ---\n{pdf_ctx}"
+                    f"\n\n--- Web Results ---\n{web_ctx}"
+                )
+                mode = "pdf_search"
 
     messages = history + [{"role": "user", "content": query}]
 
@@ -147,7 +161,7 @@ async def get_pdf_answer(
                 )
                 yield answer
 
-        return _stream_with_fallback(), mode
+        return _stream_with_fallback(), mode, None
 
     # ── Sync ──────────────────────────────────────────────────────────────────
     try:
@@ -159,7 +173,7 @@ async def get_pdf_answer(
             messages, system_prompt=system, max_tokens=1500
         )
 
-    return answer, mode
+    return answer, mode, None
 
 
 # ── Summary generator ─────────────────────────────────────────────────────────
@@ -167,7 +181,7 @@ async def get_pdf_answer(
 async def generate_pdf_summary(session_id: str) -> str:
     """
     Generate a structured summary of the entire PDF.
-    Fetches all chunks ordered by position, builds content block (capped at 14k chars).
+    Fetches all chunks ordered by position, capped at 14k chars.
     """
     from app.core.supabase import supabase_admin
 
